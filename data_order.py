@@ -63,7 +63,7 @@ augmentation_fn = Mixup(
 class NFNetWrapper(nn.Module):
     def __init__(self, num_classes):
         super(NFNetWrapper, self).__init__()
-        self.model = create_model('nfnet_f0', pretrained=True, num_classes=num_classes)
+        self.model = create_model('nfnet_f0', pretrained=False, num_classes=num_classes)
     def forward(self, x):
         return self.model(x)
 
@@ -94,6 +94,7 @@ def train_epoch(net, train_loader, criterion, optimizer, scaler, device, augment
         
         # Update learning rate scheduler
         if lr_scheduler:
+		        print(f"Current LR: {lr_scheduler.get_last_lr()}")
             lr_scheduler.step()
 
         # Track loss and accuracy
@@ -197,6 +198,7 @@ net = NFNetWrapper(num_classes=len(train_data.classes)).to(device)
 net = DDP(net, device_ids=[local_rank], output_device=local_rank)  # Use DDP
 #net = torch.compile(net)  # Optimize the model with Torch Compile
 
+num_epochs = 120  # Set the number of epochs to 120
 criterion = nn.CrossEntropyLoss().to(device)
 optimizer = optim.SGD(net.parameters(), lr=0.01, momentum=0.9, nesterov=True)
 
@@ -238,7 +240,7 @@ train_incrementally(net, train_data, val_loader, dissimilar_order, criterion, op
 """
 
 # Train the model normally with the dissimilar order
-num_epochs = 120  # Set the number of epochs to 120
+
 if local_rank == 0:
     print("\nStarting normal training with Dissimilar Order...")
 
