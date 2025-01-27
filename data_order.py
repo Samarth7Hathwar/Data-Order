@@ -14,6 +14,9 @@ from torchvision.transforms import RandAugment
 from timm.data.mixup import Mixup
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+from torch.nn.utils import clip_grad_norm_
+from torch.optim.lr_scheduler import LambdaLR
+
 
 # Paths to the training and validation datasets
 data_path = '/ds/images/imagenet'
@@ -22,8 +25,8 @@ val_dir = f"{data_path}/val_folders"
 
 # Setting up transformations for data augmentation and normalization
 transform = transforms.Compose([
-    RandAugment(),                             #Apply RandAugment
-    transforms.RandomResizedCrop((224, 224)),  # Randomly crop and resize images to a fixed size
+    RandAugment(num_ops=2, magnitude=9),        #Apply RandAugment
+    transforms.RandomResizedCrop((224, 224)),   # Randomly crop and resize images to a fixed size
     transforms.RandomHorizontalFlip(),         # Add random horizontal flipping for variation
     transforms.ToTensor(),                     # Convert images to tensors
     transforms.Normalize(mean=[0.485, 0.456, 0.406],  # Normalize with standard ImageNet mean
@@ -48,8 +51,8 @@ train_sampler = DistributedSampler(train_data, shuffle=True)
 val_sampler = DistributedSampler(val_data, shuffle=False)
 
 # Creating DataLoaders for efficient data loading
-train_loader = DataLoader(train_data, batch_size=1024, sampler=train_sampler, num_workers=10, pin_memory=True)
-val_loader = DataLoader(val_data, batch_size=1024, sampler=val_sampler, num_workers=10, pin_memory=True)
+train_loader = DataLoader(train_data, batch_size=512, sampler=train_sampler, num_workers=8, pin_memory=True, drop_last=True)
+val_loader = DataLoader(val_data, batch_size=512, sampler=val_sampler, num_workers=8, pin_memory=True, drop_last=True)
 
 augmentation_fn = Mixup(
     mixup_alpha=0.2,  # Probability for MixUp
@@ -68,7 +71,7 @@ class NFNetWrapper(nn.Module):
         return self.model(x)
 
 # Function to train the model for one epoch
-def train_epoch(net, train_loader, criterion, optimizer, scaler, device, augmentation_fn=None, lr_scheduler=None):
+def train_epoch(net, train_loader, criterion, optimizer, scaler, device, augmentation_fn=None):
     net.train()  # Set the model to training mode
     total_loss, correct, total = 0, 0, 0
 
@@ -83,7 +86,7 @@ def train_epoch(net, train_loader, criterion, optimizer, scaler, device, augment
                   
         # Forward pass with AMP (Automatic Mixed Precision)
         # I have used AMP to help speed up computations and reduce memory usage without affevting model accuracy
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             outputs = net(images)
             loss = criterion(outputs, labels)
 
@@ -92,10 +95,6 @@ def train_epoch(net, train_loader, criterion, optimizer, scaler, device, augment
         scaler.step(optimizer)
         scaler.update()
         
-        # Update learning rate scheduler
-        if lr_scheduler:
-		        print(f"Current LR: {lr_scheduler.get_last_lr()}")
-            lr_scheduler.step()
 
         # Track loss and accuracy
         total_loss += loss.item()
@@ -117,7 +116,7 @@ def validate(net, val_loader, criterion, device):
             images, labels = images.to(device), labels.to(device)
             
             # AMP for validation
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 outputs = net(images)
                 loss = criterion(outputs, labels)
 
@@ -141,7 +140,7 @@ def train_incrementally(net, train_data, val_loader, order, criterion, optimizer
         current_classes = order[:step]  # Get the current subset of classes
         train_indices = [i for i, (_, label) in enumerate(train_data.samples) if label in current_classes]
         train_subset = Subset(train_data, train_indices)
-        train_loader = DataLoader(train_subset, batch_size=64, shuffle=True, num_workers=10)
+        train_loader = DataLoader(train_subset, batch_size=64, shuffle=True, num_workers=8)
 
         # Train for the specified number of epochs
         for epoch in range(num_epochs):
@@ -168,7 +167,7 @@ def get_dissimilar_order(train_data):
     for class_idx in range(len(train_data.classes)):
         indices = [i for i, (_, label) in enumerate(train_data.samples) if label == class_idx]
         subset = Subset(train_data, indices[:10])  # Use the first 10 images of each class
-        loader = DataLoader(subset, batch_size=16, shuffle=False, num_workers=10)
+        loader = DataLoader(subset, batch_size=16, shuffle=False, num_workers=8)
 
         embeddings = []
         for images, _ in loader:
@@ -192,26 +191,29 @@ def get_dissimilar_order(train_data):
     # Return the order of classes based on their cluster labels
     return sorted(range(len(train_data.classes)), key=lambda x: kmeans.labels_[x])
 
+# Custom Linear Warm-Up + Cosine Decay Scheduler
+def linear_warmup_and_cosine_decay(epoch):
+    if epoch < 5:  # Warm-up phase
+        return epoch / 5  # Linearly scale the learning rate
+    else:  # Cosine annealing phase
+        return 0.5 * (1 + np.cos((epoch - 5) / (num_epochs - 5) * np.pi))
+
 # Set up the device and model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#device = torch.device(f"cuda:{local_rank}")
 net = NFNetWrapper(num_classes=len(train_data.classes)).to(device)
 net = DDP(net, device_ids=[local_rank], output_device=local_rank)  # Use DDP
 #net = torch.compile(net)  # Optimize the model with Torch Compile
 
 num_epochs = 120  # Set the number of epochs to 120
 criterion = nn.CrossEntropyLoss().to(device)
-optimizer = optim.SGD(net.parameters(), lr=0.01, momentum=0.9, nesterov=True)
+batch_size = 512
+max_lr = 0.1 * (batch_size / 256)
+
+optimizer = optim.SGD(net.parameters(), lr=max_lr, momentum=0.9, nesterov=True, weight_decay=1e-4)
 
 #Added Warmup period and using scheduled learning rate
-lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-    optimizer,
-    max_lr=0.1,  # Adjust max_lr as needed
-    steps_per_epoch=len(train_loader),  # Number of batches per epoch
-    epochs=num_epochs,  # Total number of epochs
-    pct_start=0.1,  # Warm-up phase for 10% of total epochs
-    anneal_strategy='cos',  # Cosine annealing
-)
-
+lr_scheduler = LambdaLR(optimizer, lr_lambda=linear_warmup_and_cosine_decay)
 scaler = torch.cuda.amp.GradScaler()
 
 # Generate class orders
@@ -246,11 +248,19 @@ if local_rank == 0:
 
 for epoch in range(num_epochs):
     # Training step
-    train_loss, train_acc = train_epoch(net, train_loader, criterion, optimizer, scaler, device, augmentation_fn=augmentation_fn, lr_scheduler=lr_scheduler)
+    train_loss, train_acc = train_epoch(net, train_loader, criterion, optimizer, scaler, device, augmentation_fn=augmentation_fn)
     
     # Validation step
     val_loss, val_acc = validate(net, val_loader, criterion, device)
     
+    # Epoch-level learning rate scheduler step
+    lr_scheduler.step()
+    
     if local_rank == 0:
         print(f"Epoch {epoch + 1}/{num_epochs}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, "
               f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+    torch.cuda.empty_cache()
+    
+              
+# Destroy process group after training
+dist.destroy_process_group()
