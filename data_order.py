@@ -16,6 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
 
 # Paths to the training and validation datasets
@@ -51,8 +52,8 @@ train_sampler = DistributedSampler(train_data, shuffle=True)
 val_sampler = DistributedSampler(val_data, shuffle=False)
 
 # Creating DataLoaders for efficient data loading
-train_loader = DataLoader(train_data, batch_size=512, sampler=train_sampler, num_workers=8, pin_memory=True, drop_last=True)
-val_loader = DataLoader(val_data, batch_size=512, sampler=val_sampler, num_workers=8, pin_memory=True, drop_last=True)
+train_loader = DataLoader(train_data, batch_size=512 // dist.get_world_size(), sampler=train_sampler, num_workers=8, pin_memory=True, drop_last=True)
+val_loader = DataLoader(val_data, batch_size=512 // dist.get_world_size(), sampler=val_sampler, num_workers=8, pin_memory=True, drop_last=True)
 
 augmentation_fn = Mixup(
     mixup_alpha=0.2,  # Probability for MixUp
@@ -191,16 +192,14 @@ def get_dissimilar_order(train_data):
     # Return the order of classes based on their cluster labels
     return sorted(range(len(train_data.classes)), key=lambda x: kmeans.labels_[x])
 
-# Custom Linear Warm-Up + Cosine Decay Scheduler
-def linear_warmup_and_cosine_decay(epoch):
-    if epoch < 5:  # Warm-up phase
-        return epoch / 5  # Linearly scale the learning rate
-    else:  # Cosine annealing phase
-        return 0.5 * (1 + np.cos((epoch - 5) / (num_epochs - 5) * np.pi))
 
 # Set up the device and model
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#device = torch.device(f"cuda:{local_rank}")
+# Distributed initialization
+local_rank = int(os.getenv('LOCAL_RANK', 0))  # Get local rank
+torch.cuda.set_device(local_rank)  # Map local rank to GPU
+device = torch.device(f'cuda:{local_rank}')
+
+# Model setup with DDP
 net = NFNetWrapper(num_classes=len(train_data.classes)).to(device)
 net = DDP(net, device_ids=[local_rank], output_device=local_rank)  # Use DDP
 #net = torch.compile(net)  # Optimize the model with Torch Compile
@@ -212,8 +211,12 @@ max_lr = 0.1 * (batch_size / 256)
 
 optimizer = optim.SGD(net.parameters(), lr=max_lr, momentum=0.9, nesterov=True, weight_decay=1e-4)
 
-#Added Warmup period and using scheduled learning rate
-lr_scheduler = LambdaLR(optimizer, lr_lambda=linear_warmup_and_cosine_decay)
+warmup_epochs = 5
+#warmup_scheduler = LinearLR(optimizer, start_factor=1e-5 / max_lr, total_iters=warmup_epochs)
+warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
+
+cosine_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - warmup_epochs, eta_min=0)
+scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
 scaler = torch.cuda.amp.GradScaler()
 
 # Generate class orders
@@ -253,8 +256,8 @@ for epoch in range(num_epochs):
     # Validation step
     val_loss, val_acc = validate(net, val_loader, criterion, device)
     
-    # Epoch-level learning rate scheduler step
-    lr_scheduler.step()
+    # Step the scheduler
+    scheduler.step()
     
     if local_rank == 0:
         print(f"Epoch {epoch + 1}/{num_epochs}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, "
