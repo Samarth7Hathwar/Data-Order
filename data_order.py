@@ -26,7 +26,7 @@ val_dir = f"{data_path}/val_folders"
 
 # Setting up transformations for data augmentation and normalization
 transform = transforms.Compose([
-    RandAugment(num_ops=2, magnitude=9),        #Apply RandAugment
+    RandAugment(num_ops=2, magnitude=9),        # Apply RandAugment
     transforms.RandomResizedCrop((224, 224)),   # Randomly crop and resize images to a fixed size
     transforms.RandomHorizontalFlip(),         # Add random horizontal flipping for variation
     transforms.ToTensor(),                     # Convert images to tensors
@@ -34,26 +34,48 @@ transform = transforms.Compose([
                          std=[0.229, 0.224, 0.225])   # and standard deviation
 ])
 
+val_transform = transforms.Compose([
+    transforms.CenterCrop(224),  # Standard center crop
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+
 # Checking if the dataset directories exist
 assert os.path.exists(train_dir), f"Training directory not found: {train_dir}"
 assert os.path.exists(val_dir), f"Validation directory not found: {val_dir}"
 
-# Distributed initialization
-dist.init_process_group(backend='nccl')  # Initialize distributed training
-local_rank = int(os.getenv('LOCAL_RANK', 0))  # Get the local rank of the process
-device = torch.device(f'cuda:{local_rank}')
+
+# Distributed setup
+def setup(rank, world_size):
+    dist.init_process_group(backend="nccl", init_method="env://")
+    device = torch.device(f"cuda:{rank}")  # Use rank to assign GPU
+    return device
+
+def cleanup():
+    dist.destroy_process_group()
+
+
+# Initialize distributed training
+local_rank = int(os.environ["LOCAL_RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+device = setup(local_rank, world_size)
+print(f"Local Rank: {local_rank}, World Size: {world_size}, Device: {device}")
 
 # Loading the datasets using ImageFolder
 train_data = datasets.ImageFolder(train_dir, transform=transform)
-val_data = datasets.ImageFolder(val_dir, transform=transform)
+val_data = datasets.ImageFolder(val_dir, transform=val_transform)
 
 # Creating DataLoaders with distributed samplers
 train_sampler = DistributedSampler(train_data, shuffle=True)
 val_sampler = DistributedSampler(val_data, shuffle=False)
 
+# Batch size per GPU
+batch_size = 512
+
 # Creating DataLoaders for efficient data loading
-train_loader = DataLoader(train_data, batch_size=512 // dist.get_world_size(), sampler=train_sampler, num_workers=8, pin_memory=True, drop_last=True)
-val_loader = DataLoader(val_data, batch_size=512 // dist.get_world_size(), sampler=val_sampler, num_workers=8, pin_memory=True, drop_last=True)
+train_loader = DataLoader(train_data, batch_size=batch_size, sampler=train_sampler, num_workers=8, pin_memory=True, drop_last=True)
+val_loader = DataLoader(val_data, batch_size=batch_size, sampler=val_sampler, num_workers=8, pin_memory=True, drop_last=True)
 
 augmentation_fn = Mixup(
     mixup_alpha=0.2,  # Probability for MixUp
@@ -68,6 +90,7 @@ class NFNetWrapper(nn.Module):
     def __init__(self, num_classes):
         super(NFNetWrapper, self).__init__()
         self.model = create_model('nfnet_f0', pretrained=False, num_classes=num_classes)
+
     def forward(self, x):
         return self.model(x)
 
@@ -79,12 +102,18 @@ def train_epoch(net, train_loader, criterion, optimizer, scaler, device, augment
     # Loop through the training data
     for images, labels in train_loader:
         images, labels = images.to(device), labels.to(device)  # Move data to the GPU
+
+        # Check for NaN values in the input data
+        if torch.isnan(images).any() or torch.isinf(images).any():
+            print("NaN or inf values detected in the input data!")
+            continue
+
         optimizer.zero_grad()
-        
+
         # Apply MixUp or CutMix augmentation
         if augmentation_fn is not None:
-            images, labels = augmentation_fn(images, labels)            
-                  
+            images, labels = augmentation_fn(images, labels)
+
         # Forward pass with AMP (Automatic Mixed Precision)
         # I have used AMP to help speed up computations and reduce memory usage without affevting model accuracy
         with torch.amp.autocast('cuda'):
@@ -93,9 +122,13 @@ def train_epoch(net, train_loader, criterion, optimizer, scaler, device, augment
 
         # Backward pass and optimization
         scaler.scale(loss).backward()
+
+        # Gradient clipping to prevent exploding gradients
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+
         scaler.step(optimizer)
         scaler.update()
-        
 
         # Track loss and accuracy
         total_loss += loss.item()
@@ -110,12 +143,17 @@ def train_epoch(net, train_loader, criterion, optimizer, scaler, device, augment
 # Function to validate the model
 def validate(net, val_loader, criterion, device):
     net.eval()  # Set the model to evaluation mode
-    total_loss, correct, total = 0, 0, 0
+    total_loss, correct, total = 0.0, 0, 0
 
     with torch.no_grad():
         for images, labels in val_loader:
             images, labels = images.to(device), labels.to(device)
-            
+
+            # Check for NaN values in the input data
+            if torch.isnan(images).any() or torch.isinf(images).any():
+                print("NaN or inf values detected in the validation data!")
+                continue
+
             # AMP for validation
             with torch.amp.autocast('cuda'):
                 outputs = net(images)
@@ -127,33 +165,23 @@ def validate(net, val_loader, criterion, device):
             correct += (preds == labels).sum().item()
             total += labels.size(0)
 
-    # Return average validation loss and accuracy
-    return total_loss / len(val_loader), 100 * correct / total
+    # Reduce across all GPUs
+    total_loss_tensor = torch.tensor(total_loss, device=device)
+    correct_tensor = torch.tensor(correct, device=device)
+    total_tensor = torch.tensor(total, device=device)
 
-"""
-# Function to incrementally train the model
-def train_incrementally(net, train_data, val_loader, order, criterion, optimizer, scaler, device, num_epochs=1, step_size=10, augmentation_fn=None):
-    net = DataParallel(net)  # Enable multi-GPU training
-    all_acc = []  # Store accuracies for each step
+    # Perform all-reduce operation to sum values across all GPUs
+    dist.reduce(total_loss_tensor, dst=0, op=dist.ReduceOp.SUM)
+    dist.reduce(correct_tensor, dst=0, op=dist.ReduceOp.SUM)
+    dist.reduce(total_tensor, dst=0, op=dist.ReduceOp.SUM)
 
-    # Loop through subsets of classes
-    for step in range(2, len(train_data.classes) + 2, step_size):
-        current_classes = order[:step]  # Get the current subset of classes
-        train_indices = [i for i, (_, label) in enumerate(train_data.samples) if label in current_classes]
-        train_subset = Subset(train_data, train_indices)
-        train_loader = DataLoader(train_subset, batch_size=64, shuffle=True, num_workers=8)
-
-        # Train for the specified number of epochs
-        for epoch in range(num_epochs):
-            train_loss, train_acc = train_epoch(net, train_loader, criterion, optimizer, scaler, device, augmentation_fn=None)
-
-        # Validate after training
-        val_loss, val_acc = validate(net, val_loader, criterion, device)
-        all_acc.append(val_acc)
-        print(f"Training with {len(current_classes)} classes: Accuracy after training: {val_acc:.2f}%")
-
-    return all_acc
-"""
+    # Only GPU 0 should print the final validation accuracy
+    if dist.get_rank() == 0:
+        total_loss = total_loss_tensor.item() / dist.get_world_size()
+        val_acc = 100 * correct_tensor.item() / total_tensor.item()
+        return total_loss, val_acc
+    else:
+        return None, None  # Other GPUs return None
 
 
 # Function to generate a dissimilar class order using clustering
@@ -188,82 +216,53 @@ def get_dissimilar_order(train_data):
     # Perform K-Means clustering
     kmeans = KMeans(n_clusters=10, random_state=42)
     kmeans.fit(class_features)
-    
+
     # Return the order of classes based on their cluster labels
     return sorted(range(len(train_data.classes)), key=lambda x: kmeans.labels_[x])
 
 
-# Set up the device and model
-# Distributed initialization
-local_rank = int(os.getenv('LOCAL_RANK', 0))  # Get local rank
-torch.cuda.set_device(local_rank)  # Map local rank to GPU
-device = torch.device(f'cuda:{local_rank}')
-
 # Model setup with DDP
 net = NFNetWrapper(num_classes=len(train_data.classes)).to(device)
 net = DDP(net, device_ids=[local_rank], output_device=local_rank)  # Use DDP
-#net = torch.compile(net)  # Optimize the model with Torch Compile
+net = torch.compile(net)  # Optimize the model with Torch Compile
+
+# Learning rate scaling
+base_lr = 0.01  # Reduced base learning rate to prevent instability
+effective_batch_size = batch_size * world_size  # Total batch size across all GPUs
+max_lr = base_lr * (effective_batch_size / 256)  # Scale learning rate
 
 num_epochs = 120  # Set the number of epochs to 120
 criterion = nn.CrossEntropyLoss().to(device)
-batch_size = 512
-max_lr = 0.1 * (batch_size / 256)
-
 optimizer = optim.SGD(net.parameters(), lr=max_lr, momentum=0.9, nesterov=True, weight_decay=1e-4)
 
 warmup_epochs = 5
-#warmup_scheduler = LinearLR(optimizer, start_factor=1e-5 / max_lr, total_iters=warmup_epochs)
 warmup_scheduler = LinearLR(optimizer, start_factor=0.1, total_iters=warmup_epochs)
-
 cosine_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - warmup_epochs, eta_min=0)
 scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
 scaler = torch.cuda.amp.GradScaler()
 
-# Generate class orders
-"""
-alphabetical_order = list(range(len(train_data.classes)))
-random_order = np.random.permutation(len(train_data.classes)).tolist()
-"""
 # Generate a dissimilar class order
-dissimilar_order = get_dissimilar_order(train_data)
-"""
-# Train with Alphabetical Order
-print("\nTraining with Alphabetical Order")
-train_incrementally(net, train_data, val_loader, alphabetical_order, criterion, optimizer, scaler, device)
-
-# Train with Random Order
-print("\nTraining with Random Order")
-net = NFNetWrapper(num_classes=len(train_data.classes)).to(device)
-net = torch.compile(net)
-train_incrementally(net, train_data, val_loader, random_order, criterion, optimizer, scaler, device)
-"""
-"""
-# Train with the dissimilar order
-print("\nTraining with Dissimilar Order")
-#net = torch.compile(net)
-train_incrementally(net, train_data, val_loader, dissimilar_order, criterion, optimizer, scaler, device, num_epochs=90, augmentation_fn=augmentation_fn)
-"""
+#dissimilar_order = get_dissimilar_order(train_data)
 
 # Train the model normally with the dissimilar order
-
 if local_rank == 0:
-    print("\nStarting normal training with Dissimilar Order...")
+    print("\nStarting normal training")
 
 for epoch in range(num_epochs):
     # Training step
     train_loss, train_acc = train_epoch(net, train_loader, criterion, optimizer, scaler, device, augmentation_fn=augmentation_fn)
-    
+
     # Validation step
     val_loss, val_acc = validate(net, val_loader, criterion, device)
-    
+
     # Step the scheduler
     scheduler.step()
-    
-    if local_rank == 0:
+
+    if val_loss is not None and val_acc is not None:
         print(f"Epoch {epoch + 1}/{num_epochs}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, "
               f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+
     torch.cuda.empty_cache()
-    
-              
+
 # Destroy process group after training
-dist.destroy_process_group()
+cleanup()
