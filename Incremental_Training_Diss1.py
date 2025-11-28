@@ -347,6 +347,7 @@ incremental_acc_alpha = train_incrementally(
 )
 
 # Print final validation accuracy for each step
+
 if local_rank == 0:
     print(f"Validation Accuracies at each step : {incremental_acc_alpha}")
 
